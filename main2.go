@@ -314,7 +314,7 @@ func calculateItemSimilarities_Parallel(ratings ItemRatings, numWorkers int) map
 		simMatrix[result.MovieB_ID][result.MovieA_ID] = result.Similarity
 	}
 
-	fmt.Println("\n✅ Cálculo de similitudes completado.")
+	fmt.Println("\nCálculo de similitudes completado.")
 	return simMatrix
 }
 
@@ -325,7 +325,7 @@ func main() {
 
 	datasets := []string{"10M", "20M", "25M"}
 	algorithms := []string{"cosine", "pearson", "jaccard"}
-	workersList := []int{2, 4, 8}
+	workersList := []int{8, 16, 32, 64}
 
 	targetUserID := 100
 	k := 25
