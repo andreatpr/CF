@@ -4,10 +4,13 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,7 +18,6 @@ import (
 // ------------------ Estructuras ------------------
 
 type ItemRatings map[int]map[int]float64
-type MovieTitles map[int]string
 
 type Recommendation struct {
 	MovieID int
@@ -25,63 +27,90 @@ type Recommendation struct {
 type Job struct {
 	MovieA_ID int
 	MovieB_ID int
-	VecA      map[int]float64
-	VecB      map[int]float64
+	StatsA    ItemStats
+	StatsB    ItemStats
 }
+
 type Result struct {
 	MovieA_ID  int
 	MovieB_ID  int
 	Similarity float64
 }
 
+type ItemStats struct {
+	Norm    float64
+	Mean    float64
+	Ratings map[int]float64
+	UserSet map[int]struct{}
+}
+
+type MovieData struct {
+	Title  string
+	Genres []string
+}
+
 // ------------------ Variables globales ------------------
 
 var similarityAlgorithm = "cosine" // "cosine", "pearson", "jaccard"
 
-// ------------------ Funciones de similitud ------------------
+// ------------------ Funciones de preprocesamiento ------------------
 
-func cosineSimilarity(vecA, vecB map[int]float64) float64 {
-	dotProduct, normA, normB := 0.0, 0.0, 0.0
-	for key, valA := range vecA {
-		normA += valA * valA
-		if valB, ok := vecB[key]; ok {
-			dotProduct += valA * valB
+func precomputeItemStats(ratings ItemRatings) map[int]ItemStats {
+	stats := make(map[int]ItemStats, len(ratings))
+	for movieID, vec := range ratings {
+		sum, sumSq := 0.0, 0.0
+		userSet := make(map[int]struct{}, len(vec))
+		for _, rating := range vec {
+			sum += rating
+			sumSq += rating * rating
+		}
+		mean := sum / float64(len(vec))
+		norm := math.Sqrt(sumSq)
+		for userID := range vec {
+			userSet[userID] = struct{}{}
+		}
+		stats[movieID] = ItemStats{
+			Norm:    norm,
+			Mean:    mean,
+			Ratings: vec,
+			UserSet: userSet,
 		}
 	}
-	for _, valB := range vecB {
-		normB += valB * valB
-	}
-	normA = math.Sqrt(normA)
-	normB = math.Sqrt(normB)
-	if normA == 0 || normB == 0 {
-		return 0.0
-	}
-	return dotProduct / (normA * normB)
+	return stats
 }
 
-func pearsonCorrelation(vecA, vecB map[int]float64) float64 {
-	commonKeys := []int{}
-	sumA, sumB := 0.0, 0.0
-	for key, valA := range vecA {
-		if valB, ok := vecB[key]; ok {
-			commonKeys = append(commonKeys, key)
-			sumA += valA
-			sumB += valB
+// ------------------ Funciones de similitud ------------------
+
+func cosineSimilarityStats(a, b ItemStats) float64 {
+	dot := 0.0
+	for userID, valA := range a.Ratings {
+		if valB, ok := b.Ratings[userID]; ok {
+			dot += valA * valB
 		}
 	}
-	n := float64(len(commonKeys))
-	if n == 0 {
+	if a.Norm == 0 || b.Norm == 0 {
 		return 0.0
 	}
-	meanA := sumA / n
-	meanB := sumB / n
+	return dot / (a.Norm * b.Norm)
+}
+
+func pearsonCorrelationStats(a, b ItemStats) float64 {
+	commonKeys := []int{}
+	for userID := range a.Ratings {
+		if _, ok := b.Ratings[userID]; ok {
+			commonKeys = append(commonKeys, userID)
+		}
+	}
+	if len(commonKeys) == 0 {
+		return 0.0
+	}
 	num, sumSqA, sumSqB := 0.0, 0.0, 0.0
-	for _, key := range commonKeys {
-		cA := vecA[key] - meanA
-		cB := vecB[key] - meanB
-		num += cA * cB
-		sumSqA += cA * cA
-		sumSqB += cB * cB
+	for _, userID := range commonKeys {
+		ca := a.Ratings[userID] - a.Mean
+		cb := b.Ratings[userID] - b.Mean
+		num += ca * cb
+		sumSqA += ca * ca
+		sumSqB += cb * cb
 	}
 	den := math.Sqrt(sumSqA) * math.Sqrt(sumSqB)
 	if den == 0 {
@@ -90,38 +119,47 @@ func pearsonCorrelation(vecA, vecB map[int]float64) float64 {
 	return num / den
 }
 
-func jaccardIndex(vecA, vecB map[int]float64) float64 {
+func jaccardIndexStats(a, b ItemStats) float64 {
 	intersection := 0.0
-	unionSet := make(map[int]bool)
-	for key := range vecA {
-		unionSet[key] = true
-		if _, ok := vecB[key]; ok {
+	unionSet := make(map[int]struct{})
+	for userID := range a.UserSet {
+		unionSet[userID] = struct{}{}
+		if _, ok := b.UserSet[userID]; ok {
 			intersection++
 		}
 	}
-	for key := range vecB {
-		unionSet[key] = true
+	for userID := range b.UserSet {
+		unionSet[userID] = struct{}{}
 	}
-	union := float64(len(unionSet))
-	if union == 0 {
+	if len(unionSet) == 0 {
 		return 0.0
 	}
-	return intersection / union
+	return intersection / float64(len(unionSet))
 }
 
 // ------------------ Carga de datos ------------------
 
-func loadItemRatings(path string) (ItemRatings, error) {
+func loadItemRatingsMatrix(path string) (ItemRatings, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("error al abrir el archivo de ratings: %w", err)
+		return nil, err
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	reader.Read()
+	header, _ := reader.Read() // primera fila: "user_id", movieIDs...
+
+	movieIDs := []int{}
+	for _, h := range header[1:] {
+		id, _ := strconv.Atoi(h)
+		movieIDs = append(movieIDs, id)
+	}
 
 	itemRatings := make(ItemRatings)
+	for i := 0; i < len(movieIDs); i++ {
+		itemRatings[movieIDs[i]] = make(map[int]float64)
+	}
+
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -131,19 +169,20 @@ func loadItemRatings(path string) (ItemRatings, error) {
 			continue
 		}
 		userID, _ := strconv.Atoi(record[0])
-		movieID, _ := strconv.Atoi(record[1])
-		rating, _ := strconv.ParseFloat(record[2], 64)
-
-		if _, ok := itemRatings[movieID]; !ok {
-			itemRatings[movieID] = make(map[int]float64)
+		for j, val := range record[1:] {
+			if val == "" {
+				continue
+			}
+			r, _ := strconv.ParseFloat(val, 64)
+			itemRatings[movieIDs[j]][userID] = r
 		}
-		itemRatings[movieID][userID] = rating
 	}
+
 	fmt.Printf("Cargados ratings para %d películas.\n", len(itemRatings))
 	return itemRatings, nil
 }
 
-func loadMovieTitles(path string) (MovieTitles, error) {
+func loadMovieData(path string) (map[int]MovieData, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("error al abrir el archivo de películas: %w", err)
@@ -151,9 +190,9 @@ func loadMovieTitles(path string) (MovieTitles, error) {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	reader.Read()
+	reader.Read() // omitir encabezado
 
-	titles := make(MovieTitles)
+	movies := make(map[int]MovieData)
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -162,11 +201,298 @@ func loadMovieTitles(path string) (MovieTitles, error) {
 		if err != nil {
 			continue
 		}
+
 		movieID, _ := strconv.Atoi(record[0])
-		titles[movieID] = record[1]
+		title := record[1]
+		genres := strings.Split(record[2], "|")
+
+		movies[movieID] = MovieData{
+			Title:  title,
+			Genres: genres,
+		}
 	}
-	fmt.Printf("Cargados %d títulos de películas.\n", len(titles))
-	return titles, nil
+	fmt.Printf("Cargados %d títulos de películas con géneros.\n", len(movies))
+	return movies, nil
+}
+
+func buildInvertedIndex(items ItemRatings, maxMoviesPerUser int) map[int][]int {
+	inv := make(map[int][]int)
+	userMovieCount := make(map[int]int)
+	totalMovies := len(items)
+	processed := 0
+	step := totalMovies / 100
+	if step == 0 {
+		step = 1
+	}
+
+	// primero contar cuántas películas calificó cada usuario
+	for _, umap := range items {
+		for uid := range umap {
+			userMovieCount[uid]++
+		}
+	}
+
+	// construir solo para usuarios *útiles*
+	for movieID, umap := range items {
+		for uid := range umap {
+			if userMovieCount[uid] <= maxMoviesPerUser { // ← filtro clave
+				inv[uid] = append(inv[uid], movieID)
+			}
+		}
+		processed++
+		if processed%step == 0 {
+			p := float64(processed) * 100 / float64(totalMovies)
+			fmt.Printf("Progreso Inverted Index: %.2f%%\r", p)
+		}
+	}
+
+	for uid := range inv {
+		sort.Ints(inv[uid])
+	}
+	return inv
+}
+
+// ------------------ Similitud de géneros ------------------
+
+func genreSimilarity(genresA, genresB []string) float64 {
+	setA := make(map[string]struct{})
+	setB := make(map[string]struct{})
+	for _, g := range genresA {
+		setA[strings.TrimSpace(g)] = struct{}{}
+	}
+	for _, g := range genresB {
+		setB[strings.TrimSpace(g)] = struct{}{}
+	}
+	inter := 0
+	for g := range setA {
+		if _, ok := setB[g]; ok {
+			inter++
+		}
+	}
+	union := len(setA) + len(setB) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
+func generateCandidatePairs(inv map[int][]int, minCo int) map[int]map[int]int {
+	cand := make(map[int]map[int]int)
+
+	// Total de usuarios (para progreso)
+	totalUsers := len(inv)
+	processed := 0
+	step := totalUsers / 100
+	if step == 0 {
+		step = 1
+	}
+
+	for _, movies := range inv {
+		for a := 0; a < len(movies); a++ {
+			i := movies[a]
+			for b := a + 1; b < len(movies); b++ {
+				j := movies[b]
+				if i > j {
+					i, j = j, i
+				}
+				if cand[i] == nil {
+					cand[i] = make(map[int]int)
+				}
+				cand[i][j]++
+			}
+		}
+
+		processed++
+		if processed%step == 0 {
+			p := float64(processed) * 100 / float64(totalUsers)
+			fmt.Printf("Progreso Candidate Pairs: %.2f%%\r", p)
+		}
+	}
+	fmt.Println("\nGeneración de pares candidatos completada.")
+
+	if minCo <= 1 {
+		return cand
+	}
+
+	// Filtrado por mínimo co-rating
+	for i, row := range cand {
+		for j, c := range row {
+			if c < minCo {
+				delete(row, j)
+			}
+		}
+		if len(row) == 0 {
+			delete(cand, i)
+		}
+	}
+	fmt.Println("Filtrado por co-rating mínimo completado.")
+	return cand
+}
+
+// ------------------ Baseline (secuencial, p=1) ------------------
+func calculateItemSimilaritiesStats_Sequential(
+	stats map[int]ItemStats,
+	movieData map[int]MovieData, candidates map[int]map[int]int,
+	alpha float64,
+) map[int]map[int]float64 {
+
+	// contar trabajos
+	numJobs := 0
+	for i := range candidates {
+		numJobs += len(candidates[i])
+	}
+
+	simMatrix := make(map[int]map[int]float64)
+
+	// progreso
+	done := 0
+	step := numJobs / 100
+	if step == 0 {
+		step = 1
+	}
+
+	for i, row := range candidates {
+		for j := range row {
+			done++
+			if done%step == 0 {
+				fmt.Printf("Progreso (secuencial): %.2f%%\r", float64(done)*100/float64(numJobs))
+			}
+
+			a := stats[i]
+			b := stats[j]
+			var simRatings float64
+			switch similarityAlgorithm {
+			case "pearson":
+				simRatings = pearsonCorrelationStats(a, b)
+			case "jaccard":
+				simRatings = jaccardIndexStats(a, b)
+			default:
+				simRatings = cosineSimilarityStats(a, b)
+			}
+			simGenres := genreSimilarity(movieData[i].Genres, movieData[j].Genres)
+			sim := alpha*simRatings + (1-alpha)*simGenres
+
+			if sim > 0.1 {
+				if simMatrix[i] == nil {
+					simMatrix[i] = make(map[int]float64)
+				}
+				if simMatrix[j] == nil {
+					simMatrix[j] = make(map[int]float64)
+				}
+				simMatrix[i][j] = sim
+				simMatrix[j][i] = sim
+			}
+		}
+	}
+	fmt.Println("\nCálculo secuencial completado.")
+	return simMatrix
+}
+
+// ------------------ Worker concurrente ------------------
+
+func workerStats(jobs <-chan Job, results chan<- Result, progress chan<- struct{}, movieData map[int]MovieData, alpha float64) {
+	for job := range jobs {
+		var simRatings float64
+		switch similarityAlgorithm {
+		case "pearson":
+			simRatings = pearsonCorrelationStats(job.StatsA, job.StatsB)
+		case "jaccard":
+			simRatings = jaccardIndexStats(job.StatsA, job.StatsB)
+		default:
+			simRatings = cosineSimilarityStats(job.StatsA, job.StatsB)
+		}
+		genresA := movieData[job.MovieA_ID].Genres
+		genresB := movieData[job.MovieB_ID].Genres
+		simGenres := genreSimilarity(genresA, genresB)
+		sim := alpha*simRatings + (1-alpha)*simGenres
+
+		// Marca de progreso (cuenta pares procesados)
+		progress <- struct{}{}
+
+		if sim > 0.1 {
+			results <- Result{
+				MovieA_ID:  job.MovieA_ID,
+				MovieB_ID:  job.MovieB_ID,
+				Similarity: sim,
+			}
+		}
+	}
+}
+
+func calculateItemSimilaritiesStats_Parallel(
+	stats map[int]ItemStats,
+	movieData map[int]MovieData,
+	candidates map[int]map[int]int, // i -> j -> co-count
+	numWorkers int, alpha float64,
+) map[int]map[int]float64 {
+
+	jobs := make(chan Job, 1000)
+	results := make(chan Result, 1000)
+	progress := make(chan struct{}, 1000)
+	var wg sync.WaitGroup
+
+	// cuenta de trabajos reales
+	numJobs := 0
+	for i := range candidates {
+		numJobs += len(candidates[i])
+	}
+
+	// workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			workerStats(jobs, results, progress, movieData, alpha)
+		}()
+	}
+
+	// fan-out SOLO de candidatos
+	go func() {
+		for i, row := range candidates {
+			for j := range row {
+				jobs <- Job{
+					MovieA_ID: i,
+					MovieB_ID: j,
+					StatsA:    stats[i],
+					StatsB:    stats[j],
+				}
+			}
+		}
+		close(jobs)
+	}()
+
+	// cierre ordenado
+	go func() { wg.Wait(); close(results); close(progress) }()
+
+	// progreso
+	go func() {
+		counter := 0
+		step := numJobs / 100
+		if step == 0 {
+			step = 1
+		}
+		for range progress {
+			counter++
+			if counter%step == 0 {
+				fmt.Printf("Progreso: %.2f%%\r", float64(counter)*100/float64(numJobs))
+			}
+		}
+	}()
+
+	// recolector
+	simMatrix := make(map[int]map[int]float64)
+	for r := range results {
+		if simMatrix[r.MovieA_ID] == nil {
+			simMatrix[r.MovieA_ID] = make(map[int]float64)
+		}
+		if simMatrix[r.MovieB_ID] == nil {
+			simMatrix[r.MovieB_ID] = make(map[int]float64)
+		}
+		simMatrix[r.MovieA_ID][r.MovieB_ID] = r.Similarity
+		simMatrix[r.MovieB_ID][r.MovieA_ID] = r.Similarity
+	}
+	fmt.Println("\nCálculo de similitudes completado.")
+	return simMatrix
 }
 
 // ------------------ Recomendaciones ------------------
@@ -196,6 +522,8 @@ func predictScore(movieID int, userRatings map[int]float64, simMatrix map[int]ma
 	neighbors := []Recommendation{}
 	for otherMovieID, similarity := range movieSimilarities {
 		if _, rated := userRatings[otherMovieID]; rated {
+			// (opcional) ignorar similitudes negativas:
+			// if similarity <= 0 { continue }
 			neighbors = append(neighbors, Recommendation{MovieID: otherMovieID, Score: similarity})
 		}
 	}
@@ -215,163 +543,117 @@ func predictScore(movieID int, userRatings map[int]float64, simMatrix map[int]ma
 	return numerator / denominator
 }
 
-// ------------------ Cálculo paralelo ------------------
-
-func worker(jobs <-chan Job, results chan<- Result, progress chan<- struct{}) {
-	for job := range jobs {
-		var similarity float64
-		switch similarityAlgorithm {
-		case "pearson":
-			similarity = pearsonCorrelation(job.VecA, job.VecB)
-		case "jaccard":
-			similarity = jaccardIndex(job.VecA, job.VecB)
-		default:
-			similarity = cosineSimilarity(job.VecA, job.VecB)
-		}
-
-		// 🔹 Notifica que se terminó un trabajo (aunque no haya resultado)
-		progress <- struct{}{}
-
-		if similarity > 0.1 {
-			results <- Result{
-				MovieA_ID:  job.MovieA_ID,
-				MovieB_ID:  job.MovieB_ID,
-				Similarity: similarity,
-			}
-		}
-	}
-}
-
-func calculateItemSimilarities_Parallel(ratings ItemRatings, numWorkers int) map[int]map[int]float64 {
-	movieIDs := make([]int, 0, len(ratings))
-	for id := range ratings {
-		movieIDs = append(movieIDs, id)
-	}
-
-	numJobs := len(movieIDs) * (len(movieIDs) - 1) / 2
-	jobs := make(chan Job, 1000)
-	results := make(chan Result, 1000)
-	progress := make(chan struct{}, 1000)
-	var wg sync.WaitGroup
-
-	// --- Lanzar los workers ---
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			worker(jobs, results, progress)
-		}()
-	}
-
-	// --- Enviar trabajos ---
-	go func() {
-		for i := 0; i < len(movieIDs); i++ {
-			for j := i + 1; j < len(movieIDs); j++ {
-				jobs <- Job{
-					MovieA_ID: movieIDs[i],
-					MovieB_ID: movieIDs[j],
-					VecA:      ratings[movieIDs[i]],
-					VecB:      ratings[movieIDs[j]],
-				}
-			}
-		}
-		close(jobs)
-	}()
-
-	// --- Cerrar canales al terminar ---
-	go func() {
-		wg.Wait()
-		close(results)
-		close(progress)
-	}()
-
-	simMatrix := make(map[int]map[int]float64)
-
-	// --- Monitorear progreso en paralelo ---
-	go func() {
-		counter := 0
-		progressInterval := numJobs / 100
-		if progressInterval == 0 {
-			progressInterval = 1
-		}
-		for range progress {
-			counter++
-			if counter%progressInterval == 0 {
-				fmt.Printf("Progreso: %.2f%%\r", float64(counter)*100/float64(numJobs))
-			}
-		}
-	}()
-
-	// --- Guardar resultados de similitud ---
-	for result := range results {
-		if _, ok := simMatrix[result.MovieA_ID]; !ok {
-			simMatrix[result.MovieA_ID] = make(map[int]float64)
-		}
-		if _, ok := simMatrix[result.MovieB_ID]; !ok {
-			simMatrix[result.MovieB_ID] = make(map[int]float64)
-		}
-		simMatrix[result.MovieA_ID][result.MovieB_ID] = result.Similarity
-		simMatrix[result.MovieB_ID][result.MovieA_ID] = result.Similarity
-	}
-
-	fmt.Println("\nCálculo de similitudes completado.")
-	return simMatrix
-}
-
 // ------------------ MAIN ------------------
 
 func main() {
-	fmt.Println("--- Pruebas de Algoritmos y Concurrencia ---")
+	fmt.Println("--- Recomendaciones usando matriz usuario-película + géneros ---")
+	runtime.GOMAXPROCS(runtime.NumCPU()) // asegurar que se usen todos los CPUs
 
-	datasets := []string{"10M", "20M", "25M"}
+	matrixPath := "./25M/25M/user_movie_matrix.csv"
+	moviePath := "./25M/25M/movies_clean.csv"
 	algorithms := []string{"cosine", "pearson", "jaccard"}
-	workersList := []int{8, 16, 32, 64}
 
-	targetUserID := 100
+	// Puedes ajustar los workers que quieres medir; agregamos 1 para baseline paralela si quieres comparar apples-to-apples.
+	userWorkers := []int{6, 8, 12, 16}
+
+	targetUser := 100
 	k := 25
+	alpha := 0.8 // peso para ratings vs géneros
 
-	for _, dataset := range datasets {
-		for _, algo := range algorithms {
-			for _, numWorkers := range workersList {
+	// Cargar una sola vez por ejecución de algoritmo (evita recomputar/recargar)
+	itemRatings, err := loadItemRatingsMatrix(matrixPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	movieData, err := loadMovieData(moviePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	itemStats := precomputeItemStats(itemRatings)
 
-				similarityAlgorithm = algo
-				fmt.Printf("\n Dataset: %s |  Algoritmo: %s |  Workers: %d\n", dataset, algo, numWorkers)
+	// Para reportar
+	type row struct {
+		Algo    string
+		P       int
+		Time    time.Duration
+		Speedup float64
+		Eff     float64
+		Pairs   int
+	}
+	report := []row{}
 
-				itemRatings, err := loadItemRatings(fmt.Sprintf("%s/%s/ratings_clean.csv", dataset, dataset))
-				if err != nil {
-					fmt.Println("Error al cargar ratings:", err)
-					continue
-				}
-				movieTitles, _ := loadMovieTitles(fmt.Sprintf("%s/%s/movies_clean.csv", dataset, dataset))
+	inv := buildInvertedIndex(itemRatings, 100)
+	minCo := 6 // exigir al menos 6 usuarios en común
+	candidates := generateCandidatePairs(inv, minCo)
 
-				start := time.Now()
-				simMatrix := calculateItemSimilarities_Parallel(itemRatings, numWorkers)
-				duration := time.Since(start)
-				fmt.Printf(" Tiempo total: %v |  Películas procesadas: %d\n", duration, len(simMatrix))
+	for _, algo := range algorithms {
+		similarityAlgorithm = algo
+		fmt.Printf("\n=== Algoritmo: %s ===\n", algo)
 
-				// 🔹 Recomendaciones reales
-				userRatings := make(map[int]float64)
-				for movieID, ratings := range itemRatings {
-					if rating, ok := ratings[targetUserID]; ok {
-						userRatings[movieID] = rating
-					}
-				}
-				allMovieIDs := make([]int, 0, len(itemRatings))
-				for id := range itemRatings {
-					allMovieIDs = append(allMovieIDs, id)
-				}
+		t0 := time.Now()
+		_ = calculateItemSimilaritiesStats_Sequential(itemStats, movieData, candidates, alpha)
+		T1 := time.Since(t0)
+		fmt.Printf("Baseline secuencial (co-rating) T1 = %v (pares candidatos=%d)\n",
+			T1, countPairs(candidates))
 
-				recommendations := generateRecommendations(userRatings, simMatrix, allMovieIDs, k)
+		// paralelo con candidatos
+		for _, p := range userWorkers {
+			start := time.Now()
+			simMatrix := calculateItemSimilaritiesStats_Parallel(itemStats, movieData, candidates, p, alpha)
+			Tp := time.Since(start)
+			speedup := float64(T1) / float64(Tp)
+			eff := speedup / float64(p)
+			fmt.Printf("p=%-2d  Tp=%-12v  Speedup=%5.2f  Efficiency=%5.2f  (pares=%d)\n",
+				p, Tp, speedup, eff, countPairs(candidates))
 
-				fmt.Println("\n--- Top 10 Películas Recomendadas ---")
-				for i, rec := range recommendations {
-					if i >= 10 {
-						break
-					}
-					title := movieTitles[rec.MovieID]
-					fmt.Printf("%d. %s (ID: %d) - Puntaje Previsto: %.4f\n", i+1, title, rec.MovieID, rec.Score)
+			report = append(report, row{
+				Algo: similarityAlgorithm, P: p, Time: Tp,
+				Speedup: speedup, Eff: eff, Pairs: countPairs(candidates),
+			})
+
+			// Generar recomendaciones para este valor de p
+			userRatings := make(map[int]float64)
+			for movieID, ratings := range itemRatings {
+				if rating, ok := ratings[targetUser]; ok {
+					userRatings[movieID] = rating
 				}
 			}
+
+			allMovieIDs := make([]int, 0, len(itemRatings))
+			for id := range itemRatings {
+				allMovieIDs = append(allMovieIDs, id)
+			}
+
+			recs := generateRecommendations(userRatings, simMatrix, allMovieIDs, k)
+
+			fmt.Printf("\n--- Top 10 Recomendaciones (p=%d) ---\n", p)
+			for i, rec := range recs {
+				if i >= 10 {
+					break
+				}
+				title := movieData[rec.MovieID].Title
+				fmt.Printf("%d. %s (ID: %d) - Puntaje Previsto: %.4f\n",
+					i+1, title, rec.MovieID, rec.Score)
+			}
+			fmt.Println()
+
 		}
+
 	}
+
+	// tabla compacta final
+	fmt.Println("\n=== Resumen Speedup / Efficiency ===")
+	fmt.Println("Algo   p   Time(ms)   Speedup   Efficiency")
+	for _, r := range report {
+		fmt.Printf("%-6s %-2d  %-9.3f %-8.2f %-10.2f\n",
+			r.Algo, r.P, float64(r.Time.Microseconds())/1000.0, r.Speedup, r.Eff)
+	}
+}
+
+func countPairs(candidates map[int]map[int]int) int {
+	total := 0
+	for _, row := range candidates {
+		total += len(row)
+	}
+	return total
 }
