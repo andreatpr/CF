@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:     
+      - red-app
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:       
+      - red-app
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    volumes:
+      - ./analisisdata:/app/analisisdata
+    networks:
+      - red-app
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    volumes:
+      - ./analisisdata:/app/analisisdata
+    networks:
+      - red-app
+
+  worker3:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    volumes:
+      - ./analisisdata:/app/analisisdata
+    networks:
+      - red-app
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      - WORKERS=worker1:9000,worker2:9000,worker3:9000
+      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_ADDR=redis:6379
+    volumes:
+      - ./analisisdata:/app/analisisdata
+    depends_on:
+      - mongo
+      - redis
+      - worker1
+      - worker2
+    networks:
+      - red-app
+
+networks:
+  red-app:
+
+volumes:
+  mongo_data:
