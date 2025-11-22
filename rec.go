@@ -654,3 +654,24 @@ func countPairs(candidates map[int]map[int]int) int {
 	}
 	return total
 }
+
+// --- Estructuras para Comunicación por Lotes (NUEVO) ---
+
+type CalculationRequest struct {
+	MovieA int
+	MovieB int
+}
+
+type BatchRequest struct {
+	Pairs []CalculationRequest
+}
+
+type CalculationResult struct {
+	MovieA     int
+	MovieB     int
+	Similarity float64
+}
+
+type BatchResponse struct {
+	Results []CalculationResult
+}

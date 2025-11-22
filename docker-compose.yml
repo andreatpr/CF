@@ -1,8 +1,11 @@
 version: '3.8'
 
 services:
+  # --- Base de Datos (MongoDB) ---
   mongo:
     image: mongo:latest
+    container_name: tf_mongo
+    restart: always
     ports:
       - "27017:27017"
     volumes:
@@ -10,18 +13,26 @@ services:
     networks:     
       - red-app
 
+  # --- Caché (Redis) ---
   redis:
     image: redis:alpine
+    container_name: tf_redis
+    restart: always
     ports:
       - "6379:6379"
     networks:       
       - red-app
 
+  # --- Workers (Nodos de Procesamiento) ---
   worker1:
     build:
       context: .
       dockerfile: Dockerfile.worker
+    container_name: tf_worker_1
+    restart: on-failure
     volumes:
+      # Mapea tu carpeta local (izquierda) a la del contenedor (derecha)
+      # ¡NO copia los datos, los lee como un espejo!
       - ./analisisdata:/app/analisisdata
     networks:
       - red-app
@@ -30,6 +41,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+    container_name: tf_worker_2
+    restart: on-failure
     volumes:
       - ./analisisdata:/app/analisisdata
     networks:
@@ -39,18 +52,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+    container_name: tf_worker_3
+    restart: on-failure
     volumes:
       - ./analisisdata:/app/analisisdata
     networks:
       - red-app
 
+  # --- Coordinador (API Principal) ---
   coordinator:
     build:
       context: .
       dockerfile: Dockerfile.coordinator
+    container_name: tf_coordinator
     ports:
       - "8080:8080"
     environment:
+      # Lista de workers accesible por su nombre de servicio en la red docker
       - WORKERS=worker1:9000,worker2:9000,worker3:9000
       - MONGO_URI=mongodb://mongo:27017
       - REDIS_ADDR=redis:6379
@@ -61,6 +79,7 @@ services:
       - redis
       - worker1
       - worker2
+      - worker3
     networks:
       - red-app
 

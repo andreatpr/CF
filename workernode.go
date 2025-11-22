@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"strconv"
-	"strings"
 )
 
 var itemStats map[int]ItemStats
@@ -73,23 +71,34 @@ func main() {
 func handle(conn net.Conn) {
 	defer conn.Close()
 
-	msg, _ := bufio.NewReader(conn).ReadString('\n')
-	msg = strings.TrimSpace(msg)
+	// Usamos Decoder/Encoder para manejar JSON directamente desde el socket
+	decoder := json.NewDecoder(conn)
+	encoder := json.NewEncoder(conn)
 
-	if msg == "PING" {
-		conn.Write([]byte("PONG\n"))
+	var req BatchRequest
+
+	// Leer el lote de tareas
+	if err := decoder.Decode(&req); err != nil {
+		log.Println("Error decodificando solicitud:", err)
 		return
 	}
 
-	parts := strings.Split(msg, " ")
-	if len(parts) != 3 || parts[0] != "SIMILARITY" {
-		conn.Write([]byte("ERROR\n"))
-		return
+	var resp BatchResponse
+
+	// Procesar cada par del lote
+	for _, p := range req.Pairs {
+		sim := computeSimilarity(p.MovieA, p.MovieB)
+		if sim > 0 { // Solo devolvemos si hay similitud relevante (optimización)
+			resp.Results = append(resp.Results, CalculationResult{
+				MovieA:     p.MovieA,
+				MovieB:     p.MovieB,
+				Similarity: sim,
+			})
+		}
 	}
 
-	a, _ := strconv.Atoi(parts[1])
-	b, _ := strconv.Atoi(parts[2])
-
-	sim := computeSimilarity(a, b)
-	conn.Write([]byte(fmt.Sprintf("RESULT %.6f\n", sim)))
+	// Enviar resultados de vuelta
+	if err := encoder.Encode(resp); err != nil {
+		log.Println("Error enviando respuesta:", err)
+	}
 }

@@ -1,0 +1,8 @@
+# Ignorar carpetas de datos gigantes
+analisisdata
+dataset
+.git
+.vscode
+# Ignorar binarios compilados
+coordinador
+worker
