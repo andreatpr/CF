@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # -------------------------------------------------------
+  # 1. CAPA DE DATOS (Persistencia y Caché)
+  # -------------------------------------------------------
+  mongo:
+    image: mongo:latest
+    container_name: tf_mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - red-app
+
+  redis:
+    image: redis:alpine
+    container_name: tf_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - red-app
+
+  # -------------------------------------------------------
+  # 2. HITO 2: BACKEND GO (ML & Recomendaciones)
+  # -------------------------------------------------------
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    container_name: tf_coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      # Lista de workers (nombres de los servicios en la red docker)
+      - WORKERS=worker1:9000,worker2:9000,worker3:9000
+      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_ADDR=redis:6379
+    volumes:
+      # Mapeo de datos CSV (Espejo del disco local)
+      - ./analisisdata:/app/analisisdata
+    depends_on:
+      - mongo
+      - redis
+      - worker1
+      - worker2
+      - worker3
+    networks:
+      - red-app
+
+  worker1:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    container_name: tf_worker_1
+    volumes: [ "./analisisdata:/app/analisisdata" ]
+    networks: [ red-app ]
+
+  worker2:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    container_name: tf_worker_2
+    volumes: [ "./analisisdata:/app/analisisdata" ]
+    networks: [ red-app ]
+
+  worker3:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    container_name: tf_worker_3
+    volumes: [ "./analisisdata:/app/analisisdata" ]
+    networks: [ red-app ]
+
+  # -------------------------------------------------------
+  # 3. HITO 3: AUTH SERVICE (Node.js - Login/Registro)
+  # -------------------------------------------------------
+  auth_service:
+    build:
+      context: ./auth_service  # <--- Busca el Dockerfile dentro de esta carpeta
+    container_name: tf_auth
+    ports:
+      - "8900:8900"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+    depends_on:
+      - mongo
+    networks:
+      - red-app
+
+  # -------------------------------------------------------
+  # 4. HITO 3: FRONTEND (React + Vite)
+  # -------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend      # <--- Busca el Dockerfile dentro de esta carpeta
+    container_name: tf_frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # Variables para que React sepa a dónde mandar las peticiones
+      - VITE_API_AUTH_URL=http://localhost:3000
+      - VITE_API_REC_URL=http://localhost:8080
+    depends_on:
+      - auth_service
+      - coordinator
+    networks:
+      - red-app
+
+networks:
+  red-app:
+
+volumes:
+  mongo_data:
