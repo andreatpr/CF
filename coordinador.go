@@ -34,10 +34,11 @@ var (
 	rdb         *redis.Client
 	mongoClient *mongo.Client
 	ctx         = context.Background()
+	startTime   time.Time
 )
 var uniqueGenres []string
 
-// --- Función Auxiliar (Ponla antes del main o por donde están las otras funcs) ---
+// --- Función Auxiliar---
 func ExtractUniqueGenres(data map[int]MovieData) []string {
 	genreSet := make(map[string]bool)
 
@@ -57,7 +58,7 @@ func ExtractUniqueGenres(data map[int]MovieData) []string {
 		list = append(list, g)
 	}
 
-	// 3. Ordenar alfabéticamente para que se vea bonito en el select
+	// 3. Ordenar alfabéticamente
 	sort.Strings(list)
 	return list
 }
@@ -231,14 +232,12 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 		limit = 10
 	} // Default 10
 
-	// 2. Clave de Caché COMPUESTA (Para diferenciar búsquedas)
-	// Ej: "recs:101:Adventure:15"
 	cacheKey := fmt.Sprintf("recs:%d:%s:%d", uid, genre, limit)
 
 	// Check Cache
 	if val, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
 		fmt.Printf("[CACHE HIT] Usuario %d Género %s\n", uid, genre)
-		go logRequestToMongo(uid, true) // Podrías guardar el género en mongo también si quieres
+		go logRequestToMongo(uid, true)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(val))
 		return
@@ -308,7 +307,79 @@ func ExtractUserRatings(r ItemRatings, userID int) map[int]float64 {
 	return out
 }
 
+func testLatency(addr string) time.Duration {
+	t0 := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return 9999 * time.Millisecond
+	}
+	conn.Close()
+	return time.Since(t0)
+}
+
+func fetchWorkerCPU(addr string) float64 {
+	// 1. Separamos el Host del Puerto original (ej: "worker1:9000" -> host="worker1")
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Si no hay puerto en el string, asumimos que es solo host o IP
+		host = addr
+	}
+
+	// 2. Construimos la URL usando solo el host y el puerto de métricas correcto
+	url := fmt.Sprintf("http://%s:9100/metrics", host)
+
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(url)
+	if err != nil {
+		// fmt.Println("Error conectando a métricas:", err) // Descomenta para depurar
+		return -1
+	}
+	defer resp.Body.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return -1
+	}
+
+	if cpu, ok := data["cpu"].(float64); ok {
+		return cpu
+	}
+	return -1
+}
+
+func handleClusterMetrics(w http.ResponseWriter, r *http.Request) {
+
+	type NodeInfo struct {
+		Addr      string  `json:"addr"`
+		CPU       float64 `json:"cpu"`
+		LatencyMS int64   `json:"latency_ms"`
+	}
+
+	out := struct {
+		Uptime string     `json:"uptime"`
+		Nodes  []NodeInfo `json:"nodes"`
+	}{}
+
+	out.Uptime = time.Since(startTime).String()
+
+	for _, addr := range workerNodes {
+
+		latency := testLatency(addr)
+		cpu := fetchWorkerCPU(addr)
+
+		out.Nodes = append(out.Nodes, NodeInfo{
+			Addr:      addr,
+			CPU:       cpu,
+			LatencyMS: latency.Milliseconds(),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
 func main() {
+	startTime = time.Now()
 	initDB() // De database.go
 	go startBroadcaster()
 
@@ -320,8 +391,6 @@ func main() {
 	}
 	fmt.Println("Workers configurados:", workerNodes)
 
-	// RUTAS DE ARCHIVOS (Ajustadas a tu estructura actual)
-	// Si tus archivos están sueltos en analisisdata, usa estas rutas:
 	const ratingsPath = "./analisisdata/resultados/20M/user_movie_matrix_20.csv"
 	const moviesPath = "./analisisdata/resultados/20M/movies_clean_20.csv"
 
@@ -336,7 +405,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Error cargando movies:", err)
 	}
-	// AGREGA ESTO INMEDIATAMENTE DESPUÉS DE CARGAR MOVIEDATA:
+
 	fmt.Println("Extrayendo géneros únicos...")
 	uniqueGenres = ExtractUniqueGenres(movieData)
 	fmt.Printf("Se encontraron %d géneros únicos.\n", len(uniqueGenres))
@@ -358,11 +427,10 @@ func main() {
 		allMovieIDs = append(allMovieIDs, id)
 	}
 
-	// --- AQUI ESTA LA MAGIA DEL CORS ---
-	// Envolvemos el handler con enableCORS
 	http.HandleFunc("/recommend", enableCORS(handleRecommend))
 
 	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/cluster", enableCORS(handleClusterMetrics))
 	http.HandleFunc("/genres", enableCORS(handleGetGenres))
 
 	fmt.Println("✅ Coordinador listo en puerto :8080")

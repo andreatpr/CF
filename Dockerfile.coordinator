@@ -2,11 +2,11 @@ FROM golang:1.23-alpine
 
 WORKDIR /app
 
-# 1. Copiar solo definiciones de dependencias
+# 1. definiciones de dependencias
 COPY go.mod go.sum ./
 RUN go mod download
 
-# 2. Copiar SOLO los archivos de código (NO los datos)
+# 2. los archivos de código 
 COPY *.go ./
 
 # 3. Compilar

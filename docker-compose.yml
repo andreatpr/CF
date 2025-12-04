@@ -53,6 +53,9 @@ services:
 
   worker1:
     build: { context: ., dockerfile: Dockerfile.worker }
+    ports:
+      - "9001:9000"
+      - "9101:9100"
     container_name: tf_worker_1
     volumes: [ "./analisisdata:/app/analisisdata" ]
     networks: [ red-app ]
@@ -60,12 +63,18 @@ services:
   worker2:
     build: { context: ., dockerfile: Dockerfile.worker }
     container_name: tf_worker_2
+    ports:
+      - "9002:9000"
+      - "9102:9100"
     volumes: [ "./analisisdata:/app/analisisdata" ]
     networks: [ red-app ]
 
   worker3:
     build: { context: ., dockerfile: Dockerfile.worker }
     container_name: tf_worker_3
+    ports:
+      - "9003:9000"
+      - "9103:9100"
     volumes: [ "./analisisdata:/app/analisisdata" ]
     networks: [ red-app ]
 

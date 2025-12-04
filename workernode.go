@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"runtime"
+	"time"
 )
 
 var itemStats map[int]ItemStats
@@ -53,6 +56,12 @@ func main() {
 	itemStats = PrecomputeItemStats(itemRatings)
 	fmt.Printf("Datos cargados. %d peliculas en memoria.\n", len(itemStats))
 
+	go func() {
+		http.HandleFunc("/metrics", handleWorkerMetrics)
+		fmt.Println("Servidor de métricas en puerto 9100")
+		log.Println(http.ListenAndServe(":9100", nil))
+	}()
+
 	ln, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
 		log.Fatal(err)
@@ -65,6 +74,7 @@ func main() {
 			continue
 		}
 		go handle(conn)
+
 	}
 }
 
@@ -101,4 +111,20 @@ func handle(conn net.Conn) {
 	if err := encoder.Encode(resp); err != nil {
 		log.Println("Error enviando respuesta:", err)
 	}
+}
+
+func handleWorkerMetrics(w http.ResponseWriter, r *http.Request) {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	cpu := runtime.NumGoroutine() // Simple proxy (opcional)
+
+	data := map[string]interface{}{
+		"cpu":       cpu, // indicador
+		"ram_mb":    memStats.Alloc / 1024 / 1024,
+		"timestamp": time.Now(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
 }
