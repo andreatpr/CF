@@ -220,8 +220,8 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	uidStr := r.URL.Query().Get("user_id")
 	uid, _ := strconv.Atoi(uidStr)
 
-	// 1. Leer nuevos parámetros
-	genre := r.URL.Query().Get("genre") // Ej: "Adventure" o ""
+	// 1. Leer parámetros
+	genre := r.URL.Query().Get("genre")
 	if genre == "" {
 		genre = "All"
 	}
@@ -230,20 +230,23 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit <= 0 {
 		limit = 10
-	} // Default 10
+	}
 
 	cacheKey := fmt.Sprintf("recs:%d:%s:%d", uid, genre, limit)
 
-	// Check Cache
+	// A. Check Cache (Redis)
 	if val, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
-		fmt.Printf("[CACHE HIT] Usuario %d Género %s\n", uid, genre)
+		fmt.Printf("⚡ [CACHE HIT] Usuario %d (Género: %s, Top: %d)\n", uid, genre, limit)
 		go logRequestToMongo(uid, true)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(val))
 		return
 	}
 
-	// Calculate (Pasamos los nuevos parámetros)
+	// B. Calcular (Go)
+	// --- ESTA ES LA LÍNEA QUE TE FALTABA ---
+	fmt.Printf("🧠 [CALCULANDO] Usuario %d (Género: %s, Top: %d) -> Procesando en Cluster...\n", uid, genre, limit)
+
 	recs, err := generateDistributedRecommendations(uid, genre, limit)
 	if err != nil {
 		http.Error(w, err.Error(), 404)
