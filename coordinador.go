@@ -35,6 +35,38 @@ var (
 	mongoClient *mongo.Client
 	ctx         = context.Background()
 )
+var uniqueGenres []string
+
+// --- Función Auxiliar (Ponla antes del main o por donde están las otras funcs) ---
+func ExtractUniqueGenres(data map[int]MovieData) []string {
+	genreSet := make(map[string]bool)
+
+	// 1. Recorrer todas las películas en memoria
+	for _, movie := range data {
+		for _, g := range movie.Genres {
+			g = strings.TrimSpace(g)
+			if g != "" && g != "(no genres listed)" {
+				genreSet[g] = true
+			}
+		}
+	}
+
+	// 2. Convertir el Mapa (Set) a Slice (Lista)
+	var list []string
+	for g := range genreSet {
+		list = append(list, g)
+	}
+
+	// 3. Ordenar alfabéticamente para que se vea bonito en el select
+	sort.Strings(list)
+	return list
+}
+
+// --- Handler del Endpoint ---
+func handleGetGenres(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(uniqueGenres)
+}
 
 // --- WebSockets ---
 var upgrader = websocket.Upgrader{
@@ -187,24 +219,40 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	uidStr := r.URL.Query().Get("user_id")
 	uid, _ := strconv.Atoi(uidStr)
 
+	// 1. Leer nuevos parámetros
+	genre := r.URL.Query().Get("genre") // Ej: "Adventure" o ""
+	if genre == "" {
+		genre = "All"
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 10
+	} // Default 10
+
+	// 2. Clave de Caché COMPUESTA (Para diferenciar búsquedas)
+	// Ej: "recs:101:Adventure:15"
+	cacheKey := fmt.Sprintf("recs:%d:%s:%d", uid, genre, limit)
+
 	// Check Cache
-	if val, err := rdb.Get(ctx, "recs:"+uidStr).Result(); err == nil {
-		fmt.Printf("[CACHE HIT] Usuario %d\n", uid)
-		go logRequestToMongo(uid, true)
+	if val, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
+		fmt.Printf("[CACHE HIT] Usuario %d Género %s\n", uid, genre)
+		go logRequestToMongo(uid, true) // Podrías guardar el género en mongo también si quieres
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(val))
 		return
 	}
 
-	// Calculate
-	recs, err := generateDistributedRecommendations(uid)
+	// Calculate (Pasamos los nuevos parámetros)
+	recs, err := generateDistributedRecommendations(uid, genre, limit)
 	if err != nil {
 		http.Error(w, err.Error(), 404)
 		return
 	}
 
 	jsonBytes, _ := json.Marshal(recs)
-	rdb.Set(ctx, "recs:"+uidStr, jsonBytes, 10*time.Minute)
+	rdb.Set(ctx, cacheKey, jsonBytes, 10*time.Minute)
 	go logRequestToMongo(uid, false)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -226,21 +274,25 @@ func logRequestToMongo(uid int, fromCache bool) {
 	coll.InsertOne(ctxT, doc)
 }
 
-func generateDistributedRecommendations(userID int) ([]map[string]interface{}, error) {
+// Actualizar la llamada a la función de lógica
+func generateDistributedRecommendations(userID int, genre string, limit int) ([]map[string]interface{}, error) {
 	userRatings := ExtractUserRatings(itemRatings, userID)
 	if len(userRatings) == 0 {
 		return nil, fmt.Errorf("usuario sin ratings")
 	}
 
-	recs := GenerateRecommendations(userRatings, globalSimMatrix, allMovieIDs, 50)
-	sort.Slice(recs, func(i, j int) bool { return recs[i].Score > recs[j].Score })
+	// Pasamos movieData, genre y limit a la función que editamos en rec.go
+	recs := GenerateRecommendations(userRatings, globalSimMatrix, allMovieIDs, movieData, genre, limit)
+
+	// (El sort ya se hizo dentro de GenerateRecommendations, pero no hace daño)
 
 	out := []map[string]interface{}{}
-	for i := 0; i < 10 && i < len(recs); i++ {
+	for _, r := range recs {
 		out = append(out, map[string]interface{}{
-			"movie_id": recs[i].MovieID,
-			"title":    movieData[recs[i].MovieID].Title,
-			"score":    recs[i].Score,
+			"movie_id": r.MovieID,
+			"title":    movieData[r.MovieID].Title,
+			"score":    r.Score,
+			"genres":   movieData[r.MovieID].Genres, // Opcional: devolver géneros al front
 		})
 	}
 	return out, nil
@@ -284,6 +336,10 @@ func main() {
 	if err != nil {
 		log.Fatal("Error cargando movies:", err)
 	}
+	// AGREGA ESTO INMEDIATAMENTE DESPUÉS DE CARGAR MOVIEDATA:
+	fmt.Println("Extrayendo géneros únicos...")
+	uniqueGenres = ExtractUniqueGenres(movieData)
+	fmt.Printf("Se encontraron %d géneros únicos.\n", len(uniqueGenres))
 
 	// Migrar usando la ruta simplificada
 	MigrateMoviesToMongo(moviesPath)
@@ -307,6 +363,7 @@ func main() {
 	http.HandleFunc("/recommend", enableCORS(handleRecommend))
 
 	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/genres", enableCORS(handleGetGenres))
 
 	fmt.Println("✅ Coordinador listo en puerto :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))

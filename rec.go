@@ -494,20 +494,54 @@ func CalculateItemSimilaritiesStats_Parallel(
 
 // ------------------ Recomendaciones ------------------
 
-func GenerateRecommendations(userRatings map[int]float64, simMatrix map[int]map[int]float64, allMovieIDs []int, k int) []Recommendation {
+func GenerateRecommendations(userRatings map[int]float64, simMatrix map[int]map[int]float64, allMovieIDs []int, movieData map[int]MovieData, targetGenre string, limit int) []Recommendation {
 	recommendations := []Recommendation{}
+
+	// Configuración de vecinos para el algoritmo (fijo internamente, ej: 25 vecinos)
+	neighborK := 25
+
 	for _, movieID := range allMovieIDs {
-		if _, seen := userRatings[movieID]; !seen {
-			predictedScore := PredictScore(movieID, userRatings, simMatrix, k)
-			if predictedScore > 0 {
-				recommendations = append(recommendations, Recommendation{MovieID: movieID, Score: predictedScore})
+		// 1. Si el usuario ya la vio, saltar
+		if _, seen := userRatings[movieID]; seen {
+			continue
+		}
+
+		// 2. NUEVO: Filtrado por género
+		// Si targetGenre no es vacío y "All", verificamos si la peli tiene ese género
+		if targetGenre != "" && targetGenre != "All" {
+			mData, exists := movieData[movieID]
+			if !exists || !containsGenre(mData.Genres, targetGenre) {
+				continue // Si no es del género, la ignoramos antes de calcular
 			}
 		}
+
+		// 3. Predecir score
+		predictedScore := PredictScore(movieID, userRatings, simMatrix, neighborK)
+		if predictedScore > 0 {
+			recommendations = append(recommendations, Recommendation{MovieID: movieID, Score: predictedScore})
+		}
 	}
+
+	// Ordenar por score
 	sort.Slice(recommendations, func(i, j int) bool {
 		return recommendations[i].Score > recommendations[j].Score
 	})
+
+	// 4. NUEVO: Respetar el límite solicitado (5, 10, 15...)
+	if len(recommendations) > limit {
+		return recommendations[:limit]
+	}
 	return recommendations
+}
+
+// Función auxiliar pequeña para buscar en el slice de strings
+func containsGenre(genres []string, target string) bool {
+	for _, g := range genres {
+		if strings.TrimSpace(g) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func PredictScore(movieID int, userRatings map[int]float64, simMatrix map[int]map[int]float64, k int) float64 {
