@@ -318,11 +318,27 @@ func testLatency(addr string) time.Duration {
 }
 
 func fetchWorkerCPU(addr string) float64 {
+<<<<<<< HEAD
+	// 1. Separamos el Host del Puerto original (ej: "worker1:9000" -> host="worker1")
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Si no hay puerto en el string, asumimos que es solo host o IP
+		host = addr
+	}
+
+	// 2. Construimos la URL usando solo el host y el puerto de métricas correcto
+	url := fmt.Sprintf("http://%s:9100/metrics", host)
+=======
 	url := fmt.Sprintf("http://%s:9100/metrics", addr)
+>>>>>>> 83ab2e38edfc260869901f5a3af3a9100ed01d38
 
 	client := http.Client{Timeout: 500 * time.Millisecond}
 	resp, err := client.Get(url)
 	if err != nil {
+<<<<<<< HEAD
+		// fmt.Println("Error conectando a métricas:", err) // Descomenta para depurar
+=======
+>>>>>>> 83ab2e38edfc260869901f5a3af3a9100ed01d38
 		return -1
 	}
 	defer resp.Body.Close()
