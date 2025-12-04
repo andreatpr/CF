@@ -1,0 +1,16 @@
+FROM golang:1.23-alpine
+
+WORKDIR /app
+
+# 1. definiciones de dependencias
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 2. los archivos de código 
+COPY *.go ./
+
+# 3. Compilar
+RUN go build -o coordinador coordinador.go rec.go database.go
+
+# 4. Ejecutar
+CMD ["./coordinador"]

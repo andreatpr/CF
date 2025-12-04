@@ -7,8 +7,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const client = new MongoClient("mongodb://localhost:27017");
-await client.connect();
+// CORRECCIÓN 1: Usar la variable de entorno o el nombre del servicio Docker 'mongo'
+const uri = process.env.MONGO_URI || "mongodb://mongo:27017";
+const client = new MongoClient(uri);
+
+// Conectamos a la BD. Si falla aquí, el server se detiene y sale error en logs
+try {
+  await client.connect();
+  console.log("✅ Conectado a MongoDB en:", uri);
+} catch (error) {
+  console.error("❌ Error conectando a MongoDB:", error);
+  process.exit(1);
+}
 const db = client.db("recsys");
 const users = db.collection("users");
 
@@ -79,4 +89,6 @@ app.get("/user/:id", async (req, res) => {
   res.json(doc);
 });
 
-app.listen(8900, () => console.log("Auth service: 8900"));
+
+const PORT = 8900;
+app.listen(PORT, () => console.log(`Auth service corriendo en puerto: ${PORT}`));
